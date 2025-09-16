@@ -3,9 +3,12 @@
 # Configure Rails Environment
 ENV["RAILS_ENV"] = "test"
 
-require "zorram"
-
+# Load the Rails sandbox environment first so Railties (like Kredis) can hook into Rails properly
 require_relative "sandbox/config/environment"
+
+# After Rails is loaded, require the engine and dependencies
+require "aasm"
+require "zorram"
 
 require "rspec/rails"
 
