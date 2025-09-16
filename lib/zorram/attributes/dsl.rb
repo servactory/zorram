@@ -14,10 +14,9 @@ module Zorram
       end
 
       module ClassMethods
-        # class_attribute :attributes_expires_in, instance_accessor: false, default: nil
-
+        # Generate Redis table name based on class namespace
         def table_name
-          name.split("::").drop(1).map(&:tableize).join(":")
+          @table_name ||= name.split("::").drop(1).map(&:tableize).join(":")
         end
 
         # Configure TTL for the kredis hash key storing attributes.
@@ -28,13 +27,9 @@ module Zorram
 
         # Create a new record and apply provided attributes at creation time
         def create!(**attrs)
-          id = Kredis.redis.incr("#{table_name}:next_id")
+          id = generate_next_id
           record = new(id:)
-          # Ensure methods are properly aliased to avoid conflicts and storage exists
-          record.send(:ensure_attributes_hash_alias!)
-          record.send(:initialize_storage!)
-          record.send(:assign_known_attributes, attrs)
-          record.send(:persist!)
+          record.send(:setup_record_for_creation, attrs)
           record
         end
 
@@ -45,54 +40,31 @@ module Zorram
 
         def find(id)
           record = new(id: id.to_i)
-          record.send(:ensure_attributes_hash_alias!)
-
-          # Read the stored values from the kredis hash named :attributes
-          data = record.send(:storage).to_h
-
-          # If there is no data in storage, consider it missing/expired and raise as per API contract
-          if data.blank?
-            raise Zorram::Exceptions::NotFoundError,
-                  "Cannot find #{name}##{id}"
-          end
-
-          # Assign only known ActiveModel attributes (declared via `attribute`) to
-          # avoid clashing with the kredis :attributes reader/writer and skip meta keys
-          allowed_keys = record.class.attribute_types.keys.map(&:to_s)
-          data.slice(*allowed_keys).each do |k, v|
-            record.public_send("#{k}=", v)
-          end
-
+          record.send(:load_from_storage!)
           record
+        end
+
+        private
+
+        def generate_next_id
+          Kredis.redis.incr("#{table_name}:next_id")
         end
       end
 
-      module InstanceMethods
+      module InstanceMethods # rubocop:disable Metrics/ModuleLength
         def save # rubocop:disable Naming/PredicateMethod
           persist!
           true
         end
 
         def update!(**attrs)
-          # Only update if storage exists (i.e., record was created and not expired)
-          unless storage_exists?
-            raise Zorram::Exceptions::StorageExpiredError,
-                  "Cannot update #{self.class.name}##{id}: storage expired or not found"
-          end
-
-          # Prevent changing the primary identifier via update API
-          attrs = attrs.except(:id, "id")
+          ensure_storage_exists!
+          attrs = sanitize_update_attributes(attrs)
 
           assign_known_attributes(attrs)
           persist!
 
-          # Return updated value when a single attribute is changed to satisfy API used in specs
-          if attrs.size == 1
-            key = attrs.keys.first
-            return public_send(key)
-          end
-
-          self
+          handle_single_attribute_update_return(attrs)
         end
 
         def update(**attrs)
@@ -101,116 +73,201 @@ module Zorram
 
         private
 
-        # Yield a Redis client created directly from ENV["REDIS_URL"] to avoid depending on Kredis initialization.
-        # Memoized per-process for efficiency.
-        def with_redis
-          begin
-            require "redis"
-          rescue LoadError
-            raise "Redis client is not available. Ensure the 'redis' gem is installed."
-          end
+        # === Storage Management ===
 
-          @__zorram_redis ||= ::Redis.new(url: ENV.fetch("REDIS_URL", "redis://127.0.0.1:6379/0"))
+        def setup_record_for_creation(attrs)
+          ensure_attributes_hash_alias!
+          initialize_storage!
+          assign_known_attributes(attrs)
+          persist!
+        end
+
+        def load_from_storage!
+          ensure_attributes_hash_alias!
+          data = storage.to_h
+
+          raise_not_found_error if data.blank?
+
+          assign_stored_attributes(data)
+        end
+
+        def ensure_storage_exists!
+          return if storage_exists?
+
+          raise Zorram::Exceptions::StorageExpiredError,
+                "Cannot update #{self.class.name}##{id}: storage expired or not found"
+        end
+
+        def storage_exists?
+          redis_connection { |redis| redis.exists(storage.key) }.to_i.positive?
+        end
+
+        def initialize_storage!
+          redis_connection do |redis|
+            redis.hset(storage.key, "__created_at", Time.current.to_i.to_s)
+            apply_ttl_if_configured(redis)
+          end
+        end
+
+        # === Redis Connection Management ===
+
+        def redis_connection
+          @__zorram_redis ||= create_redis_connection
           yield @__zorram_redis
         end
 
-        # Ensure we don't clash Kredis's :attributes reader with ActiveModel#attributes expected by AASM/Rails.
-        # After calling this, use `attributes_store` (or `storage`) for Kredis hash and `attributes` returns a Hash of model attributes.
+        def create_redis_connection
+          require_redis_gem
+          ::Redis.new(url: redis_url)
+        end
+
+        def require_redis_gem
+          require "redis"
+        rescue LoadError
+          raise "Redis client is not available. Ensure the 'redis' gem is installed."
+        end
+
+        def redis_url
+          ENV.fetch("REDIS_URL", "redis://127.0.0.1:6379/0")
+        end
+
+        # === Attributes Management ===
+
         def ensure_attributes_hash_alias!
-          return if @__attributes_alias_done
+          return if attributes_alias_configured?
+          return unless kredis_attributes_method_exists?
 
-          return unless respond_to?(:attributes)
+          setup_attributes_alias
+        end
 
-          kredis_candidate = begin
-            attributes
-          rescue StandardError
-            nil
-          end
+        def attributes_alias_configured?
+          @__attributes_alias_done
+        end
 
-          return unless kredis_candidate.is_a?(Kredis::Types::Hash)
+        def kredis_attributes_method_exists?
+          return false unless respond_to?(:attributes)
 
-          # Alias Kredis store reader
-          singleton_class.alias_method :attributes_store, :attributes
+          kredis_candidate = safely_call_attributes_method
+          kredis_candidate.is_a?(Kredis::Types::Hash)
+        end
 
-          # Redefine `attributes` to return ActiveModel attributes hash
-          define_singleton_attributes_reader!
+        def safely_call_attributes_method
+          attributes
+        rescue StandardError
+          nil
+        end
 
+        def setup_attributes_alias
+          alias_kredis_store_reader
+          redefine_attributes_reader
           @__attributes_alias_done = true
         end
 
-        def define_singleton_attributes_reader!
-          the_instance = self
-          singleton_class.class_eval do
-            define_method(:attributes) do
-              # Build an ActiveModel-like attributes hash
-              the_instance.class.attribute_types.keys.each_with_object({}) do |name, hash|
-                hash[name.to_s] = the_instance.public_send(name)
-              end
-            end
+        def alias_kredis_store_reader
+          singleton_class.alias_method :attributes_store, :attributes
+        end
+
+        def redefine_attributes_reader
+          instance = self
+          singleton_class.define_method(:attributes) do
+            build_activemodel_attributes_hash(instance)
           end
         end
 
-        # Return the Kredis::Types::Hash storage for persistence.
+        def build_activemodel_attributes_hash(instance)
+          instance.class.attribute_types.keys.each_with_object({}) do |name, hash|
+            hash[name.to_s] = instance.public_send(name)
+          end
+        end
+
         def storage
           ensure_attributes_hash_alias!
 
           return attributes_store if respond_to?(:attributes_store)
 
-          # Fallback: if alias didn't happen (e.g., method not yet defined), try original
-          val = begin
-            attributes
-          rescue StandardError
-            nil
-          end
-          return val if val.is_a?(Kredis::Types::Hash)
+          find_kredis_storage || raise_storage_error
+        end
 
+        def find_kredis_storage
+          val = safely_call_attributes_method
+          val if val.is_a?(Kredis::Types::Hash)
+        end
+
+        def raise_storage_error
           raise "Kredis storage for :attributes is not available"
         end
 
-        # Initialize the Redis hash to mark record existence without updating attributes
-        def initialize_storage!
-          # Use a placeholder field to ensure the hash exists
-          with_redis do |redis|
-            redis.hset(storage.key, "__created_at", Time.current.to_i.to_s)
-          end
-
-          # Apply TTL if configured
-          ttl = self.class.attributes_expires_in
-          return unless ttl.to_i.positive?
-
-          with_redis { |redis| redis.expire(storage.key, ttl) }
-        end
-
-        # Check whether the underlying storage for this record exists (not expired)
-        def storage_exists?
-          with_redis { |redis| redis.exists(storage.key) }.to_i.positive?
-        end
+        # === Persistence ===
 
         def persist!
-          # Validate AASM-backed attributes before persisting to ensure no invalid values slip through
           validate_aasm_state_attributes!
+          persist_attributes_to_storage
+          apply_ttl_after_persistence
+        end
 
-          # Persist declared ActiveModel attributes (except id) into the kredis hash named :attributes
-          kv = attribute_values.transform_values { |v| v&.to_s }.compact
-          kv.each { |k, v| storage[k] = v }
+        def persist_attributes_to_storage
+          attribute_values.each { |k, v| storage[k] = v&.to_s if v }
+        end
 
-          # If TTL configured, set expiry on the Redis hash key after persisting
+        def apply_ttl_after_persistence
           ttl = self.class.attributes_expires_in
           return unless ttl.to_i.positive?
 
-          with_redis { |redis| redis.expire(storage.key, ttl) }
+          redis_connection { |redis| redis.expire(storage.key, ttl) }
         end
+
+        def apply_ttl_if_configured(redis)
+          ttl = self.class.attributes_expires_in
+          return unless ttl.to_i.positive?
+
+          redis.expire(storage.key, ttl)
+        end
+
+        # === Attribute Assignment ===
 
         def assign_known_attributes(attrs)
           return if attrs.blank?
 
-          attrs.each do |k, v|
-            safe_assign_attribute(k, v)
+          attrs.each { |k, v| safe_assign_attribute(k, v) }
+        end
+
+        def assign_stored_attributes(data)
+          allowed_attributes = self.class.attribute_types.keys.map(&:to_s)
+
+          data.slice(*allowed_attributes).each do |k, v|
+            public_send("#{k}=", v)
           end
         end
 
+        def safe_assign_attribute(name, value)
+          setter = "#{name}="
+          return unless respond_to?(setter)
+
+          if aasm_managed_attribute?(name)
+            assign_aasm_attribute(name, value, setter)
+          else
+            public_send(setter, value)
+          end
+        end
+
+        def assign_aasm_attribute(name, value, setter)
+          validate_aasm_value(name, value) if value.present?
+          public_send(setter, value&.to_s)
+        end
+
+        def validate_aasm_value(name, value)
+          machine = aasm_machine_for(name.to_sym)
+          return unless machine
+
+          str = value.to_s
+          allowed_states = extract_allowed_states(machine)
+
+          return if allowed_states.include?(str)
+
+          raise ArgumentError, "Invalid #{name} '#{str}'. Allowed: #{allowed_states.join(', ')}"
+        end
+
         def attribute_values
-          # Use ActiveModel's declared attributes to avoid conflict with kredis_hash :attributes
           self.class.attribute_types.keys.each_with_object({}) do |name, hash|
             next if name.to_sym == :id
 
@@ -218,95 +275,132 @@ module Zorram
           end
         end
 
-        # Dynamically validate and assign attributes that are backed by AASM state machines.
-        # Keeps entity classes free from hard-coded setters (e.g., status=) and works for any machine name.
-        def safe_assign_attribute(name, value)
-          setter = "#{name}="
-          return unless respond_to?(setter)
+        # === AASM Integration ===
 
-          # Try to fetch aasm machine by name using the canonical API aasm(:name).
-          # Only treat as AASM-managed attribute if the name is a declared machine name
-          if aasm_machine_names.include?(name.to_sym)
-            machine = aasm_machine_for(name.to_sym)
-            if machine
-              str = value&.to_s
-              # Allow nil/blank – initial state will be handled by AASM events/transitions
-              if str.present?
-                allowed = machine.states.map { |s| s.name.to_s }
-                unless allowed.include?(str)
-                  raise ArgumentError, "Invalid #{name} '#{str}'. Allowed: #{allowed.join(', ')}"
-                end
-              end
-              return public_send(setter, str)
-            end
-          end
-
-          public_send(setter, value)
+        def aasm_managed_attribute?(name)
+          aasm_machine_names.include?(name.to_sym)
         end
 
-        # Ensure current values of AASM-backed attributes are valid before persisting.
-        # This protects cases when attributes were assigned directly (e.g., obj.status = 'fake').
         def validate_aasm_state_attributes!
-          return unless self.class.respond_to?(:aasm)
+          return unless aasm_available?
 
           aasm_machine_names.each do |machine_name|
-            next unless respond_to?(machine_name)
-
-            machine = aasm_machine_for(machine_name)
-            next unless machine
-
-            current = public_send(machine_name)
-            str = current&.to_s
-            next if str.blank?
-
-            allowed = machine.states.map { |s| s.name.to_s }
-            unless allowed.include?(str)
-              raise ArgumentError, "Invalid #{machine_name} '#{str}'. Allowed: #{allowed.join(', ')}"
-            end
+            validate_machine_state(machine_name)
           end
         end
 
-        # Try to fetch aasm machine by name using canonical API. Returns nil if not present.
+        def validate_machine_state(machine_name)
+          return unless respond_to?(machine_name)
+
+          machine = aasm_machine_for(machine_name)
+          return unless machine
+
+          current_value = public_send(machine_name)&.to_s
+          return if current_value.blank?
+
+          validate_current_state(machine_name, current_value, machine)
+        end
+
+        def validate_current_state(machine_name, current_value, machine)
+          allowed_states = extract_allowed_states(machine)
+          return if allowed_states.include?(current_value)
+
+          raise ArgumentError, "Invalid #{machine_name} '#{current_value}'. Allowed: #{allowed_states.join(', ')}"
+        end
+
         def aasm_machine_for(name)
-          return nil unless self.class.respond_to?(:aasm)
+          return nil unless aasm_available?
 
-          begin
-            m = self.class.aasm(name)
-            # Validate it's a real machine: must have states and target this attribute
-            return nil unless m.respond_to?(:states)
+          machine = safely_get_aasm_machine(name)
+          return nil unless valid_aasm_machine?(machine, name)
 
-            states = m.states
-            return nil if states.respond_to?(:empty?) && states.empty?
+          machine
+        end
 
-            # Ensure the machine is configured for the given attribute/column
-            if m.respond_to?(:attribute_name)
-              return nil unless m.attribute_name.to_sym == name.to_sym
-            elsif m.respond_to?(:config) && m.config.is_a?(Hash) && m.config[:column]
-              return nil unless m.config[:column].to_sym == name.to_sym
-            end
+        def safely_get_aasm_machine(name)
+          self.class.aasm(name)
+        rescue StandardError
+          nil
+        end
 
-            m
-          rescue StandardError
-            nil
+        def valid_aasm_machine?(machine, name)
+          return false unless machine.respond_to?(:states)
+          return false if machine_has_no_states?(machine)
+
+          machine_targets_attribute?(machine, name)
+        end
+
+        def machine_has_no_states?(machine)
+          states = machine.states
+          states.respond_to?(:empty?) && states.empty?
+        end
+
+        def machine_targets_attribute?(machine, name)
+          attribute_from_machine(machine)&.to_sym == name.to_sym
+        end
+
+        def attribute_from_machine(machine)
+          return machine.attribute_name if machine.respond_to?(:attribute_name)
+          return machine.config[:column] if machine.respond_to?(:config) &&
+                                            machine.config.is_a?(Hash) &&
+                                            machine.config[:column]
+
+          nil
+        end
+
+        def extract_allowed_states(machine)
+          machine.states.map { |state| state.name.to_s }
+        end
+
+        def aasm_machine_names
+          return [] unless aasm_available?
+
+          @aasm_machine_names ||= discover_aasm_machine_names
+        end
+
+        def discover_aasm_machine_names
+          names = extract_machine_names_from_storage
+          return names if names.any?
+
+          # Fallback: probe declared attributes
+          probe_attributes_for_machines
+        end
+
+        def extract_machine_names_from_storage
+          storage = self.class.aasm
+          return [] unless storage.respond_to?(:state_machines)
+
+          storage.state_machines.keys
+        rescue StandardError
+          []
+        end
+
+        def probe_attributes_for_machines
+          self.class.attribute_types.keys.map(&:to_sym).select do |name|
+            aasm_machine_for(name)
           end
         end
 
-        # Determine all AASM machine names for this class, robust across AASM versions.
-        def aasm_machine_names
-          names = []
-          if self.class.respond_to?(:aasm)
-            begin
-              storage = self.class.aasm
-              names = storage.state_machines.keys if storage.respond_to?(:state_machines)
-            rescue StandardError
-              # ignore and fallback
-            end
-            if names.blank?
-              # Fallback: probe declared attribute names as potential machines
-              names = self.class.attribute_types.keys.map(&:to_sym).select { |n| aasm_machine_for(n) }
-            end
-          end
-          names
+        def aasm_available?
+          self.class.respond_to?(:aasm)
+        end
+
+        # === Helper Methods ===
+
+        def sanitize_update_attributes(attrs)
+          attrs.except(:id, "id")
+        end
+
+        def handle_single_attribute_update_return(attrs)
+          return self unless attrs.size == 1
+
+          key = attrs.keys.first
+          public_send(key)
+        end
+
+        def raise_not_found_error
+          raise Zorram::Exceptions::NotFoundError,
+                "Cannot find #{self.class.name}##{id}"
         end
       end
     end
