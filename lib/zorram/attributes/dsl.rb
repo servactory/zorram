@@ -4,7 +4,7 @@ module Zorram
   module Attributes
     module DSL
       def self.included(base)
-        base.include(ActiveModel::Model)
+        base.include(ActiveModel::API)
         base.include(ActiveModel::Attributes)
         base.include(Kredis::Attributes)
 
