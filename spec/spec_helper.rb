@@ -3,9 +3,12 @@
 # Configure Rails Environment
 ENV["RAILS_ENV"] = "test"
 
-require "zorram"
+require "aasm"
+require "kredis"
 
 require_relative "sandbox/config/environment"
+
+require "zorram"
 
 require "rspec/rails"
 

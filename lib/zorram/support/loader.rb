@@ -12,7 +12,10 @@ loader.inflector = Zeitwerk::GemInflector.new(
   File.expand_path("web.rb", lib_dir)
 )
 
-loader.inflector.inflect("version" => "VERSION")
+loader.inflector.inflect(
+  "dsl" => "DSL",
+  "version" => "VERSION"
+)
 
 loader.ignore(__dir__)
 
