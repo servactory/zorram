@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require "kredis"
-
 require "zorram/support/loader"
 
 module Zorram

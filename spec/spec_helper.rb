@@ -4,6 +4,7 @@
 ENV["RAILS_ENV"] = "test"
 
 require "aasm"
+require "kredis"
 
 require_relative "sandbox/config/environment"
 
