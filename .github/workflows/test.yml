@@ -16,6 +16,18 @@ jobs:
   rspec:
     name: Ruby ${{matrix.ruby-version}} (${{ matrix.gemfile }})
     runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +61,12 @@ jobs:
         env:
           BUNDLE_GEMFILE: gemfiles/${{ matrix.gemfile }}.gemfile
 
+      - name: Wait for Redis
+        run: |
+          timeout 30 bash -c 'until printf "" 2>>/dev/null >>/dev/tcp/$0/$1; do sleep 1; done' 127.0.0.1 6379
+
       - name: RSpec
         env:
           BUNDLE_GEMFILE: gemfiles/${{ matrix.gemfile }}.gemfile
+          REDIS_URL: redis://localhost:6379/0
         run: bundle exec rspec
