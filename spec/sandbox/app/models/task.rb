@@ -18,14 +18,20 @@ class Task < Zorram::Model
 
   aasm(:status, column: :status) do
     state :created, initial: true
+    state :started
     state :processed
     state :failed
 
-    event :process do
-      transitions from: :created, to: :processed
+    event :start do
+      transitions from: :created, to: :started
     end
+
+    event :process do
+      transitions from: :started, to: :processed
+    end
+
     event :fail do
-      transitions from: :created, to: :failed
+      transitions from: :started, to: :failed
     end
   end
 
@@ -37,6 +43,7 @@ class Task < Zorram::Model
     event :pass do
       transitions from: :enqueued, to: :passed
     end
+
     event :fail do
       transitions from: :enqueued, to: :failed
     end

@@ -66,7 +66,16 @@ RSpec.describe Task do
   end
 
   describe "aasm" do
-    it { expect(task.process!).to be(true) }
+    it { expect(task.start!).to be(true) }
     it { expect(task.pass_inspection!).to be(true) }
+
+    it do
+      expect { task.process! }.to(
+        raise_error(
+          AASM::InvalidTransition,
+          "Event 'process' cannot transition from 'created'."
+        )
+      )
+    end
   end
 end
