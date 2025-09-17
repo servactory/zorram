@@ -6,13 +6,7 @@ ENV["RAILS_ENV"] = "test"
 # Load the Rails sandbox environment first so Railties (like Kredis) can hook into Rails properly
 require_relative "sandbox/config/environment"
 
-# Ensure Kredis is properly loaded before loading other dependencies
-require "kredis"
-
-# Configure Kredis after Rails is loaded but before loading zorram
-Kredis.configurator = Rails.application if defined?(Rails) && Rails.respond_to?(:application) && Rails.application
-
-# Now load other dependencies that might depend on Kredis
+# After Rails is loaded, require the engine and dependencies
 require "aasm"
 require "zorram"
 
